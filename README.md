@@ -1,2 +1,2 @@
 # dbup-deployer
-A db script executor that uses DbUp and provides variable substitution.
+A simple db script executor using DbUp that provides a CLI and variable substitution.
