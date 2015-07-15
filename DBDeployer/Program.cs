@@ -8,8 +8,6 @@ using System.Linq;
 using System.Reflection;
 using System.Text;
 using DbUp.Engine;
-using DbUp.Engine.Output;
-using DbUp.Helpers;
 using log4net;
 using log4net.Config;
 
@@ -17,199 +15,244 @@ namespace DBDeployer
 {
     class Program
     {
-        private static SqlConnection sqlConnection;
-        private static SqlConnection masterSqlConnection;
-        private static AdHocSqlRunner database;
-        private static AdHocSqlRunner master;
-
+        private const string ConnectionStringFormat = "Server={0};Database={1};Trusted_connection=true;Pooling=false";
         private static readonly ILog Log = LogManager.GetLogger(MethodBase.GetCurrentMethod().DeclaringType);
+        private static bool _isInteractive;
 
         static void Main(string[] args)
         {
             XmlConfigurator.Configure();
-            var appSettings = new AppSettings
+            var context = new Context();
+            if (!InitialiseContext(context, args))
             {
-                ConfigFile = Path.Combine(Directory.GetCurrentDirectory(), "config.json"),
-                ScriptsPath = Path.Combine(Directory.GetCurrentDirectory(), "scripts"),
-                AuxiliaryScriptsPath = Path.Combine(Directory.GetCurrentDirectory(), "AuxScripts")
-            };
-            if (!AddCommandLineArgumentsToSettings(args, appSettings))
-            {
-                ShowHelp();
                 return;
             }
+            var upgrader = new Upgrader(context, new LogToUpgradeLogFile(Log));
 
-            AssertThatScriptsExist(appSettings);
+            WhenDebugging_AssertThatScriptsExistInFolders(context);
 
-            if (!UserWantsToProceedWithExecution(appSettings))
+            if (!UserHasConfirmedExecution(context))
             {
-                Print("Aborting database create and scripting process");
+                Console.WriteLine("Aborting create database and run upgrade scripts process.");
                 return;
             }
-            using (var temporarySqlDatabase = new TemporarySqlDatabase(appSettings.TargetDatabaseName, appSettings.DataSource))
+            try
             {
-                var db = temporarySqlDatabase;
-                var executor = new DbExecutor(appSettings, new LogToUpgradeLogFile(Log));
-                executor.Execute(() => db.Create());
-                PrintScriptExecutionList(executor.ExecutedScripts, appSettings.TargetDatabaseName);
+                Console.WriteLine("Creating database if non-existent...");
+                upgrader.CreateDatabaseIfNonExistent();
+
+                if (upgrader.IsUpgradeRequired())
+                {
+                    Console.WriteLine("Upgrading Database...");
+                    var result = upgrader.PerformUpgrade();
+
+                    if (!result.Successful)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine(result.Error);
+                        Console.ResetColor();
+                        return;
+                    }
+
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine("Success! - Upgrade completed");
+                    Console.ResetColor();
+
+                    PrintScriptExecutionList(result.Scripts, context.TargetDatabaseName);
+                }
+                else
+                {
+                    Console.WriteLine("Upgrade is not required!");
+                }
+                PromptToTerminateProcess();
             }
-            Print("Press any key to terminate this utility.");
-            Console.Read();
+            catch (Exception e)
+            {
+                const string message = "Unhandled exception thrown during upgrade process.";
+                Log.Error(message, e);
+                Console.Error.WriteLine("{0}: {1}", message, e);
+            }
         }
 
-        private static void AssertThatScriptsExist(AppSettings appSettings)
+        private static void PromptToTerminateProcess()
         {
-            var scriptsPath = appSettings.ScriptsPath;
-            Print("Looking for scripts in {0}", scriptsPath);
-            Debug.Assert(Directory.Exists(scriptsPath), "directory non existant: " + scriptsPath);
-            Debug.Assert(Directory.EnumerateFiles(scriptsPath).Any(), "no scripts to apply in:" + scriptsPath);
-            Print("...Okay, scripts exist in that directory.");
+            if (_isInteractive)
+            {
+                Console.WriteLine("Press any key to terminate this utility.");
+                Console.Read();
+            }
+        }
+
+        private static bool InitialiseContext(Context context, string[] args)
+        {
+            var validCommandLineArguments = ReadCommandLineArguments(args, context);
+            if (!validCommandLineArguments)
+            {
+                ShowUsageInformation();
+                return false;
+            }
+            ReadAppSettings(context);
+            return true;
+        }
+
+        private static void ReadAppSettings(Context context)
+        {
+            context.ConfigFile = Path.Combine(Directory.GetCurrentDirectory(), AppConfig.Get<string>("SubstituteVariableFilePath"));
+            context.ScriptsPath = Path.Combine(Directory.GetCurrentDirectory(), AppConfig.Get<string>("ScriptsPath"));
+            context.AuxiliaryScriptsPath = Path.Combine(Directory.GetCurrentDirectory(), AppConfig.Get<string>("AuxiliaryScriptsPath"));
+            context.ReadSubstitionVariablesFromConfigFile();
         }
 
 
-        private static bool AddCommandLineArgumentsToSettings(string[] args, AppSettings appSettings)
+        [Conditional("DEBUG")]
+        private static void WhenDebugging_AssertThatScriptsExistInFolders(Context context)
         {
-            var  collection = new CommandArgumentCollection(args);
+            foreach (var path in new[] { context.ScriptsPath, context.AuxiliaryScriptsPath })
+            {
+                Console.WriteLine("Looking for scripts in {0}", path);
+                Debug.Assert(Directory.Exists(path), "directory non existant: " + path);
+                Debug.Assert(Directory.EnumerateFiles(path).Any(), "no scripts to apply in:" + path);
+                Console.WriteLine("...Okay, scripts exist in that directory.");
+            }
+        }
+
+        private static bool ReadCommandLineArguments(string[] args, Context context)
+        {
+            var collection = new CommandArgumentCollection(args);
+            _isInteractive = collection.HasArgument("interactive");
+
             var ca = collection.GetFirstArgument("cs");
-
             if (ca == null)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Print("You must provide an argument /cs for the connection string");
+                Console.WriteLine("You must provide an argument /cs for the connection string");
                 Console.ResetColor();
                 return false;
             }
 
-            var connectionStringBuilder = new SqlConnectionStringBuilder(ca.Value.Trim());
+            SqlConnectionStringBuilder connectionStringBuilder;
+            try
+            {
+                var connectionStringValue = ca.Value.Trim();
+                connectionStringBuilder = new SqlConnectionStringBuilder(connectionStringValue);
+            }
+            catch (ArgumentException argEx)
+            {
+                Log.Error(argEx);
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine(
+@"Invalid connection string argument for /cs
+Argument must have the following format: Server=_Instance Name_;Database=_Catalog Name_;[Trusted_connection=True;Pooling=False]");
+                Console.ResetColor();
+                return false;
+            }
 
             var targetDatabaseName = connectionStringBuilder.InitialCatalog;
             var dataSource = connectionStringBuilder.DataSource;
-            var connectionString = String.Format("Server={0};Database={1};Trusted_connection=true;Pooling=false", dataSource, targetDatabaseName);
+            var connectionString = String.Format(ConnectionStringFormat,
+                dataSource, targetDatabaseName);
 
-            
-            appSettings.TargetDatabaseName = targetDatabaseName;
-            appSettings.ConnectionString = connectionString;
-            appSettings.DataSource = dataSource;
+            var crmArg = collection.GetFirstArgument("crmname");
+            if (crmArg == null)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("You must provide an argument /crmname for the crm database name");
+                Console.ResetColor();
+                return false;
+            }
 
-            sqlConnection = new SqlConnection(connectionString);
-            database = new AdHocSqlRunner(sqlConnection.CreateCommand, "dbo", () => true);
-
-            var builder = new SqlConnectionStringBuilder(connectionString) { InitialCatalog = "master" };
-
-            masterSqlConnection = new SqlConnection(builder.ToString());
-            master = new AdHocSqlRunner(() => masterSqlConnection.CreateCommand(), "dbo", () => true);
-
+            context.CrmDatabaseName = crmArg.Value.Trim();
+            context.TargetDatabaseName = targetDatabaseName;
+            context.ConnectionString = connectionString;
+            context.DataSource = dataSource;
             return true;
         }
 
 
-        private static bool UserWantsToProceedWithExecution(AppSettings settings)
+        static bool UserHasConfirmedExecution(Context settings)
         {
-            Print("Connection string to Target database: {0}", settings.ConnectionString);
-            Print("Target Database name: {0}", settings.TargetDatabaseName);
-            Print("Proceed with creating database and running scripts? (in {0}) (Y/N)", settings.ScriptsPath);
+            if (!_isInteractive)
+            {
+                return true;
+            }
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("Connection string to Target database: {0}", settings.ConnectionString);
+            Console.WriteLine("Target Database name: {0}", settings.TargetDatabaseName);
+            Console.WriteLine("CRM Database name is: {0}", settings.CrmDatabaseName);
+            PrintLine();
+            Console.WriteLine("The following variable substitutions (read from {0}) will be applied:", Path.GetFileName(settings.ConfigFile));
+            Console.WriteLine(AsString(settings.Variables));
+            PrintLine();
+            Console.ForegroundColor = ConsoleColor.White;
+            Console.WriteLine("Proceed with creating database and running scripts? (Y/N)");
+            Console.ResetColor();
             return (Console.ReadLine() ?? "").ToUpperInvariant().Trim().StartsWith("Y");
         }
-        
-        private static void ShowHelp()
+
+        private static void PrintLine()
+        {
+            Console.WriteLine();
+        }
+
+        private static string AsString(IDictionary<string, string> dict)
+        {
+            var result = new StringBuilder();
+            dict.ToList().ForEach(d => result.AppendLine(String.Format(CultureInfo.CurrentUICulture, "{0} => {1}", d.Key, d.Value)));
+            return result.ToString();
+        }
+
+        private static void ShowUsageInformation()
         {
             Console.ForegroundColor = ConsoleColor.Cyan;
-            Print(
-@"db.deployr.exe - SQL database script executor using DbUp
-Usage:
-    db.deployr.exe /cs:{SQL Connection String}
+            Console.WriteLine(
+@"DBDeployer - Creates a database and executes SQL scripts using DbUp
+Remarks: 
+    
+    [DB Connections]
+    This utility will establish two db connections in succession for creating and upgrading the target database.
+    The first connection will target the master catalog and attempt to create a new database. 
+    The second connection will target the new database and run the upgrade scripts.
+    
+    [Variable Substitution]
+    This utility reads in key-value pairs from a JSON file (default is config.json) in order to perform variable substitution on the SQL upgrade scripts. 
+    Any variables bordered with $ (e.g. $Name$) will be replaced with values from the config file (e.g. Name:Value).
 
-    /cs:{Target Connection String} : The complete connection string of
-                                     the target database you are 
-                                     trying to deploy to.   
+Usage:
+    db.deployr.exe /cs:{SQL Connection String} /crmname:{CRM Database Name} [/interactive]                            
+
+    /cs:{Target Connection String} : The complete connection string of the target database that 
+                                     you are trying to deploy to.
+
+    /crmname:{CRM Database Name}   : The name of CRM database that the target database is using.
+
+    /interactive                   : Prompts user to confirm each step of the upgrade process.
 
 Example: 
-    db.deployr.exe /cs:Server=testdatabase01\mydatabaseinstance;Database=MyTargetDatabase;Trusted_connection=True;Pooling=False
+    DBDeployer /cs:Server=test-db01\sql12crm01;Database=MyTargetDatabase;Trusted_connection=True;Pooling=False /crmname:[MyTest_MSCRM] /interactive
 
 ");
             Console.ResetColor();
         }
-        
-        class LogToUpgradeLogFile : IUpgradeLog
-        {
 
-            public LogToUpgradeLogFile(ILog log)
-            {
-                _log = log;
-            }
-
-            private readonly ILog _log;
-            public void WriteInformation(string format, params object[] args)
-            {
-                var message = String.Format(CultureInfo.CurrentUICulture, format, args);
-                _log.Info(message);
-                Print(message);
-            }
-
-            public void WriteError(string format, params object[] args)
-            {
-                var message = String.Format(CultureInfo.CurrentUICulture, format, args);
-                _log.Error(message);
-                Print(message);
-            }
-
-            public void WriteWarning(string format, params object[] args)
-            {
-                var message = String.Format(CultureInfo.CurrentUICulture, format, args);
-                _log.Warn(message);
-                Print(message);
-            }
-        }
-
-        private static string GetExecutedScriptsAsString(IEnumerable<SqlScript> scripts)
+        private static string ToStringOneLinePerElement(IEnumerable<SqlScript> scripts)
         {
             var names = new StringBuilder();
             scripts.ToList().ForEach(s => names.AppendLine(String.Format("{0}", s.Name)));
             return names.ToString();
-
         }
+
         private static void PrintScriptExecutionList(IEnumerable<SqlScript> scripts, string serverName)
         {
             if (!scripts.Any())
             {
-                Print("No scripts were executed successfully on {0}.", serverName);
+                Console.WriteLine("No scripts were executed successfully on {0}.", serverName);
                 return;
             }
 
-            Print(
+            Console.WriteLine(
 @"!!! Attention DEVELOPERS !!!!!!!!!!!!!!!!!!!!
-The following scripts were executed successfully on {0} - were you expecting any additional scripts to be applied?? Please double-check! ", serverName);
-            Print(GetExecutedScriptsAsString(scripts));
+The following scripts were successfully executed on {0} - were you expecting any additional scripts to be applied?? Please double-check this list! ", serverName);
+            Console.WriteLine(ToStringOneLinePerElement(scripts));
         }
-
-
-        public static void Print(string format, params object[] args)
-        {
-            Console.WriteLine(format, args);
-        }
-
-        public static void Print(string format)
-        {
-            Console.WriteLine(format);
-        }
-
-
-        public static void Print(Exception ex)
-        {
-            Console.WriteLine(ex);
-        }
-
-
-        //        private static void CreateDatabase()
-        //        {
-        //            masterSqlConnection.Open();
-        //            master.ExecuteNonQuery(String.Format(@"IF NOT EXISTS(select 1 from sysdatabases where name = '{0}' )
-        //BEGIN
-        //CREATE DATABASE [{0}]
-        //END
-        //", _targetDatabaseName));
-
-        //            masterSqlConnection.Close();
-        //        }
     }
 }

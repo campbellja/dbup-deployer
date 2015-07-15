@@ -50,6 +50,7 @@
     </Reference>
     <Reference Include="System" />
     <Reference Include="System.ComponentModel.DataAnnotations" />
+    <Reference Include="System.Configuration" />
     <Reference Include="System.Core" />
     <Reference Include="System.Data.SQLite">
       <HintPath>..\packages\System.Data.SQLite.Core.1.0.97.0\lib\net451\System.Data.SQLite.dll</HintPath>
@@ -61,10 +62,12 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="AppSettings.cs" />
+    <Compile Include="AppConfig.cs" />
     <Compile Include="CommandArgument.cs" />
     <Compile Include="CommandArgumentCollection.cs" />
-    <Compile Include="DbExecutor.cs" />
+    <Compile Include="Context.cs" />
+    <Compile Include="LogToUpgradeLogFile.cs" />
+    <Compile Include="Upgrader.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
